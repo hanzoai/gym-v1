@@ -4,114 +4,86 @@ import torch.multiprocessing as mp
 
 from exogym.train_node import TrainNode
 from exogym.strategy import Strategy
+from exogym.common import TrainConfig
+from exogym.aux.utils import print_dataset_size, _average_model_states
+from exogym.minibatch_probe import find_minibatch_size_isolated
+from exogym.utils import init_process_group_portsafe
 
 import os
-from abc import abstractmethod
 import copy
 from dataclasses import dataclass
 from typing import Optional, List, Any, Dict, Union, Callable
 from collections import OrderedDict
 
-def print_dataset_size(dataset: torch.utils.data.Dataset):
-    import pickle
-    import io
 
-    buffer = io.BytesIO()
-    pickle.dump(dataset, buffer, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"Dataset size: {buffer.tell() // 1024 // 1024} MB")
+def _build_connection(config: TrainConfig):
+    """
+    This is the default callback for setting up pytorch distributed connections.
+    All ranks are assumed to be on the same machine, and device is defaulted to cpu.
+    In future, this can be swapped out assuming non-localhost connections, etc.
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(config.port)
 
+    if config.device == "" or config.device is None:
+        if torch.cuda.is_available():
+            config.device = "cuda"
+        elif torch.backends.mps.is_available():
+            config.device = "mps"
+        else:
+            config.device = "cpu"
 
-@dataclass
-class TrainingConfig:
-    """Configuration class that holds all training parameters for serialization."""
+    # initialize the process group
+    if config.device == "cuda":
+        # If we haven't specified devices, use all devices.
+        if config.devices is None:
+            config.devices = range(torch.cuda.device_count())
 
-    model: torch.nn.Module
-    train_dataset: Union[
-        torch.utils.data.Dataset, Callable[[int, int, bool], torch.utils.data.Dataset]
-    ]
-    val_dataset: Union[
-        torch.utils.data.Dataset, Callable[[int, int, bool], torch.utils.data.Dataset]
-    ]
-    strategy: Strategy
-    num_epochs: int
-    num_nodes: int
-    max_steps: Optional[int] = None
-    device: Optional[str] = None
-    devices: Optional[List[int]] = None
-    batch_size: int = 16
-    minibatch_size: int = 16
-    shuffle: bool = True
-    val_size: int = 64
-    val_interval: int = 100
-    autocast: bool = False
-    checkpoint_interval: int = 100
-    trainer_class: type = None
-    kwargs: Dict[str, Any] = None
+        init_process_group_portsafe(
+            "nccl" if len(config.devices) == config.num_nodes else "gloo",
+            rank=config.rank,
+            world_size=config.num_nodes,
+        )
+        config.device = torch.device(
+            f"cuda:{config.devices[config.rank % len(config.devices)]}"
+        )
+        torch.cuda.set_device(config.device)
+    elif config.device == "cpu":
+        init_process_group_portsafe("gloo", rank=config.rank, world_size=config.num_nodes)
+        config.device = torch.device("cpu")
+    elif config.device == "mps":
+        init_process_group_portsafe("gloo", rank=config.rank, world_size=config.num_nodes)
+        config.device = torch.device("mps")
+    else:
+        raise ValueError(f"Invalid device type: {config.device}")
 
-    def __post_init__(self):
-        if self.kwargs is None:
-            self.kwargs = {}
+    print(f"Rank {config.rank} using device {config.device}")
 
-
-def _worker(rank: int, config: TrainingConfig, result_queue: mp.Queue):
+def _worker(rank: int, config: TrainConfig, result_queue: mp.Queue):
     """
     Entry point executed in every child process.
     This function is importable as exogym.trainer._worker, making it notebook-safe.
     """
-    # Create trainer instance in the worker process
-    trainer = config.trainer_class(
-        model=config.model,
-        train_dataset=config.train_dataset,
-        val_dataset=config.val_dataset,
-        **config.kwargs,
-    )
+    config.rank = rank    
 
-    # Set all the configuration parameters
-    trainer.num_epochs = config.num_epochs
-    trainer.max_steps = config.max_steps
-    trainer.strategy = config.strategy
-    trainer.num_nodes = config.num_nodes
-    trainer.device = config.device
-    trainer.devices = config.devices
-    trainer.batch_size = config.batch_size
-    trainer.minibatch_size = config.minibatch_size
-    trainer.shuffle = config.shuffle
-    trainer.val_size = config.val_size
-    trainer.val_interval = config.val_interval
-    trainer.autocast = config.autocast
-    trainer.checkpoint_interval = config.checkpoint_interval
+    _build_connection(config)
 
-    # Run the training process and get the final model state dict
-    final_model_state = trainer._fit_process(rank)
+    # TODO: Should these happen here or in TrainNode.__init__() ?
+    config.model = copy.deepcopy(config.model).to(config.device)
+    config.strategy = copy.deepcopy(config.strategy)
+    config.strategy._init_node(config.model, config.rank, config.num_nodes)
+
+    train_node = TrainNode(config=config)
+    final_model_state = train_node.train()
 
     # Move tensors to CPU and detach to avoid CUDA serialization issues
     cpu_state_dict = OrderedDict()
     for key, tensor in final_model_state.items():
         cpu_state_dict[key] = tensor.detach().cpu()
 
-    # Put the result in the queue
     result_queue.put((rank, cpu_state_dict))
 
-def _average_model_states(model_states: Dict[int, OrderedDict]) -> OrderedDict:
-    """Average model state dictionaries from multiple processes."""
-    if not model_states:
-        return None
-
-    # Get the first state dict as template
-    averaged_state = OrderedDict()
-    first_state = list(model_states.values())[0]
-
-    # Average each parameter
-    for param_name in first_state.keys():
-        # Stack all versions of this parameter
-        param_stack = torch.stack(
-            [state[param_name] for state in model_states.values()]
-        )
-        # Average them
-        averaged_state[param_name] = torch.mean(param_stack, dim=0)
-
-    return averaged_state
-
+    dist.destroy_process_group()
 
 class Trainer:
     """
@@ -130,13 +102,16 @@ class Trainer:
             Callable[[int, int, bool], torch.utils.data.Dataset],
         ],
         start_port: Optional[int] = None,
-        **kwargs,
+        device: str = None,
+        devices: list[int] = None,
     ):
         self.model_orig = model
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
-        self.kwargs = kwargs
         self.port = start_port if start_port is not None else 12355
+        self.device = device
+        self.devices = devices
+        self._minibatch_cache = {}
 
     def fit(
         self,
@@ -144,50 +119,27 @@ class Trainer:
         strategy: Strategy,
         num_nodes: int,
         max_steps: int = None,
-        device: str = None,
-        devices: list[int] = None,
         batch_size: int = 16,
-        minibatch_size: int = 16,
+        minibatch_size: int = None,
         shuffle: bool = True,
         val_size: int = 64,
         val_interval: int = 100,
         autocast: bool = False,
-        checkpoint_interval: int = 100,
+        checkpoint_interval: Optional[int] = None,
+        correlation_interval: Optional[int] = None,
+        save_dir: str = "./checkpoints",
+        dataloader_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
-        """
-        Train the model. For single process training (num_nodes=1), runs directly.
-        For multi-process training, delegates to launch_ddp for notebook safety.
-        Returns the final trained model (averaged across nodes for multi-node training).
-        """
-        # Store parameters
-        self.num_epochs = num_epochs
-        self.max_steps = max_steps
-        self.strategy = strategy
-        self.num_nodes = num_nodes
-        self.device = device
-        self.devices = devices
-        self.batch_size = batch_size
-        self.minibatch_size = minibatch_size
-        self.shuffle = shuffle
-        self.val_size = val_size
-        self.val_interval = val_interval
-        self.autocast = autocast
-        self.checkpoint_interval = checkpoint_interval
-
-        assert self.val_size // self.batch_size > 0, "val_size must be geq batch_size"
-
-        if hasattr(self, "kwargs"):
-            self.kwargs.update(kwargs)
-        else:
-            self.kwargs = kwargs
-
-        self.port += 1
+        # assert val_size // batch_size > 0, f"val_size must be geq batch_size: {val_size} // {batch_size}"
+        assert batch_size > 0, 'local batch size needs to be nonzero'
+        if minibatch_size is not None:
+            assert minibatch_size <= batch_size, f'minibatch_size ({minibatch_size}) must be <= batch_size ({batch_size}) for gradient accumulation'
 
         # Move a *copy* of the model to CPU so that pickling for mp.spawn does not attempt to share GPU storage.
         cpu_model = copy.deepcopy(self.model_orig).cpu()
 
-        config = TrainingConfig(
+        self.config = TrainConfig(
             model=cpu_model,
             train_dataset=self.train_dataset,
             val_dataset=self.val_dataset,
@@ -195,8 +147,9 @@ class Trainer:
             num_epochs=num_epochs,
             num_nodes=num_nodes,
             max_steps=max_steps,
-            device=device,
-            devices=devices,
+            port=self.port,
+            device=self.device,
+            devices=self.devices,
             batch_size=batch_size,
             minibatch_size=minibatch_size,
             shuffle=shuffle,
@@ -204,142 +157,69 @@ class Trainer:
             val_interval=val_interval,
             autocast=autocast,
             checkpoint_interval=checkpoint_interval,
-            trainer_class=self.__class__,
-            kwargs=self.kwargs,
+            correlation_interval=correlation_interval,
+            save_dir=save_dir,
+            dataloader_kwargs=dataloader_kwargs or {},
+            kwargs=kwargs,
         )
+
+        # Auto-detect minibatch_size if not provided
+        if minibatch_size is None:
+            force_recalculate = kwargs.get('force_minibatch_recalculate', False)
+            minibatch_size = self.find_minibatch_size(
+                num_nodes,
+                batch_size,
+                force_recalculate=force_recalculate,
+            )
+            self.config.minibatch_size = minibatch_size
+
+        self.port += 1
+
         
-        # Create a manager and queue for collecting results
         manager = mp.Manager()
         result_queue = manager.Queue()
 
-        # Use mp.spawn with the result queue
         mp.spawn(
             _worker,
-            args=(config, result_queue),
-            nprocs=config.num_nodes,
+            args=(self.config, result_queue),
+            nprocs=self.config.num_nodes,
             start_method="spawn",
             join=True,
         )
 
-        # Collect results
         model_states = {}
-        for _ in range(config.num_nodes):
+        for _ in range(self.config.num_nodes):
             rank, state_dict = result_queue.get()
             model_states[rank] = state_dict
 
-        # Average the models
         averaged_state_dict = _average_model_states(model_states)
 
-        if averaged_state_dict is not None:
-            # Create a copy of the original model and load the averaged state
-            final_model = copy.deepcopy(self.model_orig)
-            final_model.load_state_dict(averaged_state_dict)
-            return final_model
-        else:
-            return None
+        final_model = copy.deepcopy(self.model_orig)
+        final_model.load_state_dict(averaged_state_dict)
+        return final_model
 
-    def _fit_process(self, rank):
-        """
-        The core training logic that runs in each process.
-        Renamed from _fit and removed the spawn call.
-        Returns the final model state dict.
-        """
-        self.rank = rank
-
-        self._build_connection()
-
-        self.model = copy.deepcopy(self.model_orig).to(self.device)
-
-        self.strategy = copy.deepcopy(self.strategy)
-        self.strategy._init_node(self.model, self.rank, self.num_nodes)
-
-        # Handle dataset factory vs direct dataset for sampler creation
-        if callable(self.train_dataset):
-            # For dataset factory, we don't need a distributed sampler
-            # since the factory should return the appropriate subset for this rank
-            self.sampler = None
-        else:
-            # For direct dataset, use DistributedSampler as before
-            self.sampler = torch.utils.data.DistributedSampler(
-                self.train_dataset,
-                num_replicas=self.num_nodes,
-                rank=self.rank,
-                shuffle=self.shuffle,
-            )
-
-        sim = TrainNode(
-            self.model,
-            self.train_dataset,
-            self.sampler,
-            self.val_dataset,
-            self.strategy,
-            self.device,
-            self.rank,
-            self.num_nodes,
-            num_epochs=self.num_epochs,
-            max_steps=self.max_steps,
-            batch_size=self.batch_size,
-            minibatch_size=self.minibatch_size,
-            val_size=self.val_size,
-            val_interval=self.val_interval,
-            checkpoint_interval=self.checkpoint_interval,
-            autocast=self.autocast,
-            **self.kwargs,
+    def clear_minibatch_cache(self):
+        """Clear the cached minibatch size results."""
+        self._minibatch_cache.clear()
+        print("Minibatch size cache cleared.")
+    
+    def find_minibatch_size(self, num_nodes: int, batch_size: int, force_recalculate: bool = False):
+        cache_key = (num_nodes, batch_size)
+        
+        if not force_recalculate and cache_key in self._minibatch_cache:
+            cached_size = self._minibatch_cache[cache_key]
+            print(f'Using cached minibatch_size={cached_size} for batch_size={batch_size}, num_nodes={num_nodes}')
+            return cached_size
+        
+        # Use the isolated minibatch probe
+        minibatch_size = find_minibatch_size_isolated(
+            self.config,
+            num_nodes,
+            batch_size,
+            devices=self.devices,
+            device=self.device,
+            port=self.port
         )
-
-        final_state_dict = sim.train()
-
-        self._process_cleanup()
-
-        return final_state_dict
-
-    @abstractmethod
-    def _build_connection(self):
-        raise NotImplementedError
-
-    def _process_cleanup(self):
-        dist.destroy_process_group()
-
-
-class LocalTrainer(Trainer):
-    def _build_connection(self):
-        """
-        This is the default callback for setting up pytorch distributed connections.
-        All ranks are assumed to be on the same machine, and device is defaulted to cpu.
-        """
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.port)
-
-        if self.device == "" or self.device is None:
-            if torch.cuda.is_available():
-                self.device = "cuda"
-            elif torch.backends.mps.is_available():
-                self.device = "mps"
-            else:
-                self.device = "cpu"
-
-        # initialize the process group
-        if self.device == "cuda":
-            # If we haven't specified devices, use all devices.
-            if self.devices is None:
-                self.devices = range(torch.cuda.device_count())
-
-            dist.init_process_group(
-                "nccl" if len(self.devices) == self.num_nodes else "gloo",
-                rank=self.rank,
-                world_size=self.num_nodes,
-            )
-            self.device = torch.device(
-                f"cuda:{self.devices[self.rank % len(self.devices)]}"
-            )
-            torch.cuda.set_device(self.device)
-        elif self.device == "cpu":
-            dist.init_process_group("gloo", rank=self.rank, world_size=self.num_nodes)
-            self.device = torch.device("cpu")
-        elif self.device == "mps":
-            dist.init_process_group("gloo", rank=self.rank, world_size=self.num_nodes)
-            self.device = torch.device("mps")
-        else:
-            raise ValueError(f"Invalid device type: {self.device}")
-
-        print(f"Rank {self.rank} using device {self.device}")
+        
+        self._minibatch_cache[cache_key] = minibatch_size
+        return minibatch_size 

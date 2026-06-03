@@ -136,9 +136,14 @@ def build_dataset_small(dataset, block_size=1024, start_pc=0.0, end_pc=1.0):
 
     # Convert tokenized lists to 1-d contiguous stream.
     def aggregate_examples(examples):
-        all_ids = np.concatenate(
-            [np.array(ids + [eos_token_id]) for ids in examples["tokenized"] if ids]
-        )
+        arrays = [
+            np.asarray(ids + [eos_token_id], dtype=np.int64)
+            for ids in examples["tokenized"]
+            if ids
+        ]
+        if len(arrays) == 0:
+            return {"ids": np.asarray([], dtype=np.int64)}
+        all_ids = np.concatenate(arrays)
         return {"ids": all_ids}
 
     dataset_processed = dataset.map(
@@ -148,9 +153,29 @@ def build_dataset_small(dataset, block_size=1024, start_pc=0.0, end_pc=1.0):
         num_proc=os.cpu_count(),
     )
 
-    dataset_processed.set_format(type="numpy", columns=["ids"])
+    # Instead of using .set_format(type="numpy", columns=["ids"]) and then dataset_processed["ids"],
+    # which returns a datasets.arrow_dataset.Column (not a numpy array), we should concatenate all arrays.
+    # This will ensure 'data' is a numpy array.
 
-    data = dataset_processed["ids"]
+    # Get all values from the "ids" column and build a contiguous 1-D numpy array
+    ids_list = list(dataset_processed["ids"])  # may be list of arrays, lists, or ints
+    if len(ids_list) == 0:
+        raise ValueError("No token ids produced by preprocessing")
+
+    first_item = ids_list[0]
+    if isinstance(first_item, np.ndarray):
+        # Already arrays, just concatenate
+        data = np.concatenate(ids_list) if len(ids_list) > 1 else first_item
+    elif isinstance(first_item, (list, tuple)):
+        # Convert lists/tuples to arrays, then concatenate
+        arrays = [np.array(x) for x in ids_list if len(x) > 0]
+        if len(arrays) == 0:
+            data = np.array([], dtype=np.int64)
+        else:
+            data = np.concatenate(arrays) if len(arrays) > 1 else arrays[0]
+    else:
+        # Scalars (e.g., ints). Build directly into an array.
+        data = np.asarray(ids_list)
 
     print(f"Dataset size: {data.shape}")
 

@@ -1,31 +1,75 @@
-from exogym.trainer import LocalTrainer
+from exogym.trainer import Trainer
 from nanogpt import GPT, GPTConfig, get_dataset
 from exogym.strategy.optim import OptimSpec
 
+import os
 import argparse
 import torch
+from functools import partial
+
+
+def get_dataset_defaults(dataset_name):
+    """Get default configuration for a specific dataset."""
+    defaults = {
+        "owt": {
+            "start_pc": 0.0,
+            "end_pc": 0.04,
+            "val_start_pc": 0.99,
+            "val_end_pc": 1.0,
+            "model_size": "base",
+            "max_steps": 30000,
+        },
+        "shakespeare": {
+            "start_pc": 0.0,
+            "end_pc": 0.9,
+            "val_start_pc": 0.9,
+            "val_end_pc": 1.0,
+            "model_size": "small",
+            "max_steps": 5000,
+        },
+    }
+    # Return defaults for the dataset, or empty dict if not defined
+    return defaults.get(dataset_name, {})
 
 
 def gen_run_name(args, strategy):
     """Generate wandb name based on strategy and arguments."""
     base_name = f"bs{args.batch_size}_lr{args.lr:.0e}"
 
-    if strategy == "base":
-        return f"{base_name}_warm{args.warmup_steps}_max{args.max_steps}"
-    elif strategy == "ddp":
+    if strategy == "ddp":
         return f"ddp_{base_name}_n{args.num_nodes}"
     elif strategy == "fedavg":
-        return f"{base_name}_H{args.H}_n{args.num_nodes}"
+        return f"fedavg_{base_name}_H{args.H}_n{args.num_nodes}"
     elif strategy == "sparta":
-        return f"p{args.p_sparta}_n{args.num_nodes}_lr{args.lr:.0e}"
+        return f"sparta_p{args.p_sparta}_n{args.num_nodes}_lr{args.lr:.0e}"
     elif strategy == "diloco":
-        return f"{base_name}_outer{args.outer_lr:.0e}_H{args.diloco_interval}"
+        return f"diloco_{base_name}_outer{args.outer_lr:.0e}_H{args.H}"
     elif strategy == "demo":
-        return f"{base_name}_topk{args.compression_topk}_decay{args.compression_decay}"
+        return f"demo_{base_name}_topk{args.compression_topk}_decay{args.compression_decay}"
     elif strategy == "diloco_sparta":
-        return f"{base_name}_outer{args.outer_lr:.0e}_H{args.diloco_interval}_p{args.p_sparta}"
+        return f"diloco_sparta_{base_name}_outer{args.outer_lr:.0e}_H{args.H}_p{args.p_sparta}"
     else:
         return base_name
+
+
+def owt_dataset_factory(dataset_name, block_size, start_pc, end_pc, val_start_pc, val_end_pc,
+                        rank: int, num_nodes: int, train_dataset: bool) -> torch.utils.data.Dataset:
+    """Dataset factory function for OWT dataset."""
+    if train_dataset:
+        start = rank / num_nodes * (end_pc - start_pc) + start_pc
+        end = (rank + 1) / num_nodes * (end_pc - start_pc) + start_pc
+    else:
+        start = val_start_pc
+        end = val_end_pc
+    
+    dataset, _ = get_dataset(
+        dataset_name,
+        block_size=block_size,
+        device="cpu",
+        start_pc=start,
+        end_pc=end,
+    )
+    return dataset
 
 
 def arg_parse():
@@ -36,23 +80,23 @@ def arg_parse():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="shakespeare",
+        default="owt",
         help="which dataset to use (shakespeare, wikitext, code, owt)",
     )
-    parser.add_argument("--start_pc", type=float, default=0.0)
-    parser.add_argument("--end_pc", type=float, default=0.9)
-    parser.add_argument("--val_start_pc", type=float, default=0.9)
-    parser.add_argument("--val_end_pc", type=float, default=1.0)
+    parser.add_argument("--start_pc", type=float, default=None)
+    parser.add_argument("--end_pc", type=float, default=None)
+    parser.add_argument("--val_start_pc", type=float, default=None)
+    parser.add_argument("--val_end_pc", type=float, default=None)
     parser.add_argument("--block_size", type=int, default=1024)
 
     # Training arguments
-    parser.add_argument("--num_nodes", type=int, default=1)
+    parser.add_argument("--num_nodes", type=int, default=4)
     parser.add_argument("--device", type=str, default="")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument(
         "--model_size",
         type=str,
-        default="small",
+        default=None,
         choices=["small", "base", "medium", "large", "xl"],
     )
     parser.add_argument("--dropout", type=float, default=None)
@@ -63,7 +107,7 @@ def arg_parse():
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--max_norm", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=1000)
-    parser.add_argument("--max_steps", type=int, default=10000)
+    parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--cosine_anneal", action="store_true")
 
     # Logging and reproducibility
@@ -72,6 +116,11 @@ def arg_parse():
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--val_size", type=int, default=256)
     parser.add_argument("--val_interval", type=int, default=100)
+    parser.add_argument("--correlation_interval", type=int, default=None)
+    parser.add_argument("--checkpoint_interval", type=int, default=None)
+    parser.add_argument("--save_dir", type=str, default="./checkpoints")
+    parser.add_argument("--start_port", type=int, default=15000)
+    parser.add_argument("--log_x_axis", type=str, default="step", choices=["step", "examples"], help="X-axis for wandb logging")
 
     # Strategy selection
     parser.add_argument(
@@ -84,7 +133,7 @@ def arg_parse():
 
     # FedAvg-specific arguments
     parser.add_argument(
-        "--H", type=int, default=100, help="FedAvg communication interval"
+        "--H", type=int, default=200, help="FedAvg communication interval"
     )
     parser.add_argument(
         "--island_size", type=int, default=None, help="FedAvg island size"
@@ -102,9 +151,6 @@ def arg_parse():
     )
 
     # DiLoCo-specific arguments
-    parser.add_argument(
-        "--diloco_interval", type=int, default=100, help="DiLoCo communication interval"
-    )
     parser.add_argument(
         "--outer_lr", type=float, default=0.7, help="DiLoCo outer learning rate"
     )
@@ -196,7 +242,7 @@ def create_strategy(args):
         return DiLoCoStrategy(
             optim_spec=inner_optim,
             outer_optim_spec=outer_optim,
-            H=args.diloco_interval,
+            H=args.H,
             lr_scheduler="lambda_cosine",
             lr_scheduler_kwargs=lr_scheduler_kwargs,
             max_norm=args.max_norm,
@@ -208,13 +254,14 @@ def create_strategy(args):
         optim = OptimSpec(
             torch.optim.AdamW,
             lr=args.lr,
-            compression_decay=args.compression_decay,
-            compression_topk=args.compression_topk,
-            compression_chunk=args.compression_chunk,
             weight_decay=args.weight_decay,
         )
         return DeMoStrategy(
             optim_spec=optim,
+            compression_decay=args.compression_decay,
+            compression_topk=args.compression_topk,
+            compression_chunk=args.compression_chunk,
+            weight_decay=args.weight_decay,
             lr_scheduler="lambda_cosine",
             lr_scheduler_kwargs=lr_scheduler_kwargs,
             max_norm=args.max_norm,
@@ -233,7 +280,7 @@ def create_strategy(args):
         return SPARTADiLoCoStrategy(
             inner_optim_spec=inner_optim,
             outer_optim_spec=outer_optim,
-            H=args.diloco_interval,
+            H=args.H,
             p_sparta=args.p_sparta,
             sparta_interval=args.sparta_interval,
             lr_scheduler="lambda_cosine",
@@ -249,32 +296,35 @@ def main():
     parser = arg_parse()
     args = parser.parse_args()
 
+    # Get dataset-specific defaults
+    dataset_defaults = get_dataset_defaults(args.dataset)
+    
+    # Apply dataset defaults for any unset arguments
+    if args.start_pc is None:
+        args.start_pc = dataset_defaults.get("start_pc", 0.0)
+    if args.end_pc is None:
+        args.end_pc = dataset_defaults.get("end_pc", 0.9)
+    if args.val_start_pc is None:
+        args.val_start_pc = dataset_defaults.get("val_start_pc", 0.9)
+    if args.val_end_pc is None:
+        args.val_end_pc = dataset_defaults.get("val_end_pc", 1.0)
+    if args.model_size is None:
+        args.model_size = dataset_defaults.get("model_size", "small")
+    if args.max_steps is None:
+        args.max_steps = dataset_defaults.get("max_steps", 5000)
+
     ## Example of dataset factory for OWT.
     if args.dataset == "owt" or False:
-
-        def dataset_factory(
-            rank: int, num_nodes: int, train_dataset: bool
-        ) -> torch.utils.data.Dataset:
-            if train_dataset:
-                start_pc = (
-                    rank / num_nodes * (args.end_pc - args.start_pc) + args.start_pc
-                )
-                end_pc = (rank + 1) / num_nodes * (
-                    args.end_pc - args.start_pc
-                ) + args.start_pc
-            else:
-                start_pc = args.val_start_pc
-                end_pc = args.val_end_pc
-
-            dataset, _ = get_dataset(
-                args.dataset,
-                block_size=args.block_size,
-                device="cpu",
-                start_pc=start_pc,
-                end_pc=end_pc,
-            )
-            return dataset
-
+        dataset_factory = partial(
+            owt_dataset_factory,
+            args.dataset,
+            args.block_size,
+            args.start_pc,
+            args.end_pc,
+            args.val_start_pc,
+            args.val_end_pc
+        )
+        
         train_dataset = dataset_factory
         val_dataset = dataset_factory
 
@@ -305,31 +355,41 @@ def main():
     model = GPT(gpt_config)
 
     # Create trainer
-    trainer = LocalTrainer(
+    trainer = Trainer(
         model,
         train_dataset,
         val_dataset,
+        start_port=args.start_port,
     )
 
     # Create strategy based on selection
     strategy = create_strategy(args)
 
     # Train
-    trainer.fit(
+    model = trainer.fit(
         num_epochs=args.epochs,
         max_steps=args.max_steps,
         strategy=strategy,
         num_nodes=args.num_nodes,
         device=args.device,
         batch_size=args.batch_size,
-        minibatch_size=args.minibatch_size or args.batch_size,
+        minibatch_size=args.minibatch_size,
         shuffle=(args.dataset != "owt"),
         val_size=args.val_size,
         val_interval=args.val_interval,
+        correlation_interval=args.correlation_interval,
+        save_dir=args.save_dir,
         wandb_project=args.wandb_project,
-        # run_name=args.run_name or gen_run_name(args, args.strategy)
-        run_name=None,
+        run_name=args.run_name or gen_run_name(args, args.strategy),
+        log_x_axis=args.log_x_axis
     )
+
+    save_dir = "checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
+    run_name = args.run_name or gen_run_name(args, args.strategy)
+    model_path = os.path.join(save_dir, f"{run_name}_model.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"Model saved to {model_path}")
 
 
 if __name__ == "__main__":

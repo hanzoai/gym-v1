@@ -2,43 +2,81 @@ from tqdm import tqdm
 import numpy as np
 from torch import nn
 
-from .utils import create_config
+from exogym.aux.utils import create_config
 
 import json
 import os
 from datetime import datetime
 import csv
+from typing import Literal
 
 
 class Logger:
-    def __init__(self, model: nn.Module, max_steps: int):
+    def __init__(self, model: nn.Module, max_steps: int, strategy=None, train_node=None, extra_config=None, init_tqdm=True):
         self.model = model
         self.max_steps = max_steps
-
-        self.pbar = tqdm(total=self.max_steps, initial=0)
-
-        tqdm.write("Logger initialized.")
+        
+        # Create configuration once in parent class
+        self.config = create_config(
+            model=model,
+            strategy=strategy,
+            train_node=train_node,
+            extra_config=extra_config or {}
+        )
+        # Add max_steps to config if not already there
+        if 'max_steps' not in self.config:
+            self.config['max_steps'] = max_steps
 
         self.step = 0
         self.current_lr = 0
+        self.examples_trained = 0
+        
+        # Initialize tqdm if requested (can be delayed by child classes)
+        if init_tqdm:
+            self.pbar = tqdm(total=self.max_steps, initial=0)
+        else:
+            self.pbar = None
+    
+    def init_tqdm(self):
+        """Initialize tqdm progress bar - can be called by child classes after their setup"""
+        if self.pbar is None:
+            self.pbar = tqdm(total=self.max_steps, initial=self.step)
 
     def log(self, data: dict):
+        """Log arbitrary data - no-op in base logger"""
         pass
 
     def log_loss(self, loss: float, name: str):
+        """Log validation/evaluation loss - no-op in base logger"""
+        pass
+    
+    def log_info(self, value: float, name: str):
+        """Log informational metric - no-op in base logger"""
         pass
 
+    def log_examples_trained(self, examples: int):
+        self.examples_trained += examples
+
     def log_train(self, loss: float):
-        self.pbar.update(1)
-        self.pbar.set_postfix(
-            {
-                "train_loss": f"{loss:.4f}",
-                "lr": f"{self.current_lr:.6f}",
-            }
-        )
+        if self.pbar:
+            self.pbar.update(1)
+            self.pbar.set_postfix(
+                {
+                    "train_loss": f"{loss:.4f}",
+                    "lr": f"{self.current_lr:.6f}",
+                }
+            )
 
     def increment_step(self):
         self.step += 1
+    
+    def set_step(self, step: int):
+        """Set the current step - used for checkpoint resumption"""
+        self.step = step
+        if self.pbar:
+            self.pbar.n = step
+            self.pbar.last_print_n = step
+            self.pbar.refresh()
 
     def log_lr(self, lr: float):
         self.current_lr = lr
@@ -53,6 +91,7 @@ class WandbLogger(Logger):
         train_node=None,
         wandb_project: str = None,
         run_name: str = None,
+        x_axis: Literal['step', 'examples'] = 'step',
     ):
 
         try:
@@ -62,29 +101,25 @@ class WandbLogger(Logger):
                 "wandb is not installed. Please install it using `pip install wandb`."
             )
 
-        super().__init__(model, max_steps)
+        # Pass extra config to parent, delay tqdm initialization
+        extra_config = {
+            "wandb_project": wandb_project,
+            "x_axis": x_axis,
+        }
+        super().__init__(model, max_steps, strategy, train_node, extra_config, init_tqdm=False)
 
         self.wandb_project = wandb_project
         self.run_name = run_name or None
-
-        # Create wandb configuration using the utility function
-        wandb_config = create_config(
-            model=model,
-            strategy=strategy,
-            train_node=train_node,
-            extra_config={
-                "max_steps": max_steps,
-            },
-        )
+        self.x_axis = x_axis
 
         print(
-            f'initialized wandb project with model size {wandb_config["model_parameters"]}'
+            f'WandB Logger initialized with model size {self.config["model_parameters"]}M parameters'
         )
 
         init_kwargs = {
             "project": self.wandb_project,
             "name": self.run_name,
-            "config": wandb_config,
+            "config": self.config,
             "resume": "allow",  # Allow resuming if possible, or create new
         }
 
@@ -95,10 +130,14 @@ class WandbLogger(Logger):
             f"Started new wandb run '{self.run_name}' (ID: {wandb.run.id}). Starting at step {self.step}."
         )
 
-        # Update tqdm progress bar
-        self.pbar.n = self.step
-        self.pbar.last_print_n = self.step
-        self.pbar.refresh()
+        # Now initialize tqdm after all print statements
+        self.init_tqdm()
+        
+        # Update tqdm progress bar if needed
+        if self.step > 0:
+            self.pbar.n = self.step
+            self.pbar.last_print_n = self.step
+            self.pbar.refresh()
 
         strategy.lr_callbacks.append(self.log_lr)
 
@@ -107,7 +146,10 @@ class WandbLogger(Logger):
 
         if hasattr(self, "run_name"):
             data = {f"{name}_loss": loss, f"{name}_perplexity": float(np.exp(loss))}
-            wandb.log(data, step=self.step)
+            if self.x_axis == 'step':
+                wandb.log(data, step=self.step)
+            elif self.x_axis == 'examples':
+                wandb.log(data, step=self.examples_trained)
 
     def log_train(self, loss: float):
         import wandb
@@ -120,7 +162,10 @@ class WandbLogger(Logger):
             if self.current_lr:
                 data["lr"] = self.current_lr
 
-            wandb.log(data, step=self.step)
+            if self.x_axis == 'step':
+                wandb.log(data, step=self.step)
+            elif self.x_axis == 'examples':
+                wandb.log(data, step=self.examples_trained)
 
         self.pbar.update(1)
         self.pbar.set_postfix(
@@ -129,6 +174,16 @@ class WandbLogger(Logger):
                 "lr": f"{self.current_lr:.6f}",
             }
         )
+
+    def log_info(self, value: float, name: str):
+        import wandb
+
+        if hasattr(self, "run_name"):
+            data = {name: value}
+            if self.x_axis == 'step':
+                wandb.log(data, step=self.step)
+            elif self.x_axis == 'examples':
+                wandb.log(data, step=self.examples_trained)
 
 
 class CSVLogger(Logger):
@@ -141,8 +196,21 @@ class CSVLogger(Logger):
         log_dir: str = "logs",
         run_name: str = None,
     ):
+        # Pass extra config to parent, delay tqdm initialization
+        extra_config = {
+            "run_name": run_name,
+            "log_dir": log_dir,
+        }
+        super().__init__(model, max_steps, strategy, train_node, extra_config, init_tqdm=False)
+        
+        # Create run directory
+        self.run_dir = os.path.join(log_dir, run_name)
+        os.makedirs(self.run_dir, exist_ok=True)
 
-        super().__init__(model, max_steps)
+        print(
+            f'CSV Logger initialized with model size {self.config["model_parameters"]}M parameters'
+        )
+        print(f"Logging CSVs to directory: ./{self.run_dir}")
 
         # Generate run name based on datetime if not provided
         if run_name is None:
@@ -151,17 +219,14 @@ class CSVLogger(Logger):
         self.run_name = run_name
         self.log_dir = log_dir
 
-        # Create run directory
-        self.run_dir = os.path.join(log_dir, run_name)
-        os.makedirs(self.run_dir, exist_ok=True)
-
         # Create CSV file paths
         self.train_csv_path = os.path.join(self.run_dir, "train.csv")
         self.val_csv_path = os.path.join(self.run_dir, "validation.csv")
 
         # Create CSV files with headers
         self._init_csv_file(
-            self.train_csv_path, ["step", "train_loss", "train_perplexity", "lr"]
+            self.train_csv_path,
+            ["step", "examples_trained", "train_loss", "train_perplexity", "lr"],
         )
         self._init_csv_file(
             self.val_csv_path,
@@ -174,27 +239,13 @@ class CSVLogger(Logger):
             ],
         )
 
-        # Create configuration using the utility function
-        config = create_config(
-            model=model,
-            strategy=strategy,
-            train_node=train_node,
-            extra_config={
-                "max_steps": max_steps,
-                "run_name": run_name,
-                "log_dir": log_dir,
-            },
-        )
-
         # Save config as JSON
         config_path = os.path.join(self.run_dir, "config.json")
         with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
+            json.dump(self.config, f, indent=2)
 
-        print(
-            f'CSV Logger initialized with model size {config["model_parameters"]}M parameters'
-        )
-        print(f"Logging to directory: {self.run_dir}")
+        # Now initialize tqdm after all print statements
+        self.init_tqdm()
 
         # Add learning rate callback
         strategy.lr_callbacks.append(self.log_lr)
@@ -269,6 +320,7 @@ class CSVLogger(Logger):
         """Log training loss to CSV"""
         data = {
             "step": self.step,
+            "examples_trained": self.examples_trained,
             "train_loss": loss,
             "train_perplexity": float(np.exp(loss)),
         }
@@ -285,3 +337,7 @@ class CSVLogger(Logger):
                 "lr": f"{self.current_lr:.6f}",
             }
         )
+
+    def log_info(self, value: float, name: str):
+        """Log training loss to CSV"""
+        raise NotImplementedError('log_info not implemented for CSV logging.')

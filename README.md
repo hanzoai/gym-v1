@@ -3,6 +3,8 @@
 <!-- # EXO Gym <img src="docs/exogym_logo.png" alt="EXO Gym Logo" height="50" align="top"> -->
 # <img src="docs/exogym_logo.png" alt="EXO Gym Logo" height="60" align="top"> Gym
 
+[![Open in Hanzo](https://hanzo.app/badges/open-in-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/gym-v1&ref=main&action=open) [![Edit with Hanzo](https://hanzo.app/badges/edit-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/gym-v1&ref=main&action=edit) [![Deploy with Hanzo](https://hanzo.app/badges/deploy-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/gym-v1&ref=main&action=deploy)
+
 <img src="docs/imagination.png" alt="EXO Gym" width="50%">
 
 <!-- New image ideas: A macbook with a loss curve on it, with a 'thinking bubbles' coming out of the macbook, and in the bubble there is a stack of 4 H100 GPUs. It's like the laptop is imagining the cluster.  -->
